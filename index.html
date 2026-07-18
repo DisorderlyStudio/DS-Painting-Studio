@@ -183,6 +183,9 @@
   </div>
 
   <div class="foot">The outline uses a free open-source line-art model that runs right in your browser — it never sees who's in the picture, so it works on anything. First use downloads a small model file (~a few MB).</div>
+  <div class="foot" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line)">
+    © <span id="copyYear">2026</span> <a href="https://disorderlystudio.com" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">Disorderly Studio</a>. All rights reserved.
+  </div>
 </div>
 
 <script>
@@ -193,7 +196,7 @@
   var notes=["","",""];
   var current=2, mode="step";
   var NKEY="painting-studio-app-notes";
-  var MAXPROC=1200, OUTLINE_MAX=1100, BLOCKIN_COLORS=36;
+  var MAXPROC=1200, OUTLINE_MAX=1100, BLOCKIN_COLORS=36, QUANT_MAX=260;
 
   var statusEl=document.getElementById('status');
   var drop=document.getElementById('drop'), fileInput=document.getElementById('file');
@@ -285,7 +288,7 @@
     images[0]=oc.toDataURL('image/png'); paintCard(0);
   }
 
-  // ---------- Block-in engine (flat colour) ----------
+  // ---------- Block-in engine (flat colour, edge-aware) ----------
   function makeBlockin(srcDataURL,K){
     K=K||BLOCKIN_COLORS;
     return loadImage(srcDataURL).then(function(img){
@@ -294,13 +297,31 @@
       var c=document.createElement('canvas');c.width=w;c.height=h;var ctx=c.getContext('2d',{willReadFrequently:true});
       ctx.drawImage(img,0,0,w,h);
       var s=ctx.getImageData(0,0,w,h).data;
-      var vivid=saturate(s,1.2);
-      var base=medianFilter(vivid,w,h,1);
-      base=boxBlur(base,w,h,2);        // flatten brush/canvas texture so blocks come out clean
-      var q=quantizeImage(base,w,h,K);
-      var cleaned=medianFilter(q,w,h,1);
+      var vivid=saturate(s,1.15);
+      var pre=medianFilter(vivid,w,h,1);   // light despeckle only — segmentation handles the rest
+
+      var lab=new Float32Array(w*h*3);
+      for(var p=0;p<w*h;p++){var i=p*4,cc=rgb2lab(pre[i],pre[i+1],pre[i+2]);lab[p*3]=cc[0];lab[p*3+1]=cc[1];lab[p*3+2]=cc[2];}
+
+      // Step 1: group pixels into regions that follow the painting's real edges (not a blur radius)
+      // Denser superpixels + lower compactness = small bright features (eyes, teeth) survive
+      // as their own regions instead of being swallowed by big neighbours.
+      var numSuperpixels=Math.max(300,Math.min(6000,Math.round((w*h)/380)));
+      var seg=slicSegments(lab,w,h,numSuperpixels,10);
+      // rescue very bright specks (eye whites, teeth) that still ended up in a darker region
+      rescueBrightRegions(lab,seg,w,h);
+      // Step 2: merge those regions down to K flat colours
+      var mergeK=Math.max(2,Math.min(seg.numK,K));
+      var merged=paletteFromCenters(seg.centers,mergeK);
+      var paletteRGB=merged.palette.map(function(pc){return lab2rgb(pc[0],pc[1],pc[2]);});
+
+      var out=new Uint8ClampedArray(w*h*4);
+      for(var pp=0;pp<w*h;pp++){
+        var segId=seg.labels[pp],palIdx=merged.segAssign[segId],rgb=paletteRGB[palIdx],oi=pp*4;
+        out[oi]=rgb[0];out[oi+1]=rgb[1];out[oi+2]=rgb[2];out[oi+3]=255;
+      }
       var oc=document.createElement('canvas');oc.width=w;oc.height=h;var octx=oc.getContext('2d');
-      var id=octx.createImageData(w,h);id.data.set(cleaned);octx.putImageData(id,0,0);
+      var oid=octx.createImageData(w,h);oid.data.set(out);octx.putImageData(oid,0,0);
       return oc.toDataURL('image/png');
     });
   }
@@ -371,23 +392,175 @@
       out[(y*w+x)*4+3]=255;}
     return out;
   }
-  function quantizeImage(data,w,h,K){
-    var n=w*h,sampleN=Math.min(n,12000),stride=Math.max(1,Math.floor(n/sampleN)),samples=[],p,i;
-    for(p=0;p<n;p+=stride){i=p*4;samples.push([data[i],data[i+1],data[i+2]]);}
-    var cents=[];for(var c=0;c<K;c++){var sp0=samples[Math.floor(c*(samples.length-1)/(K-1||1))]||samples[0];cents.push([sp0[0],sp0[1],sp0[2]]);}
-    for(var it=0;it<12;it++){var sums=[];for(var m=0;m<K;m++)sums.push([0,0,0,0]);
-      for(var q=0;q<samples.length;q++){var sp=samples[q],best=0,bd=1e12;
-        for(var cc=0;cc<K;cc++){var cn=cents[cc],dr=sp[0]-cn[0],dg=sp[1]-cn[1],db=sp[2]-cn[2],dist=dr*dr+dg*dg+db*db;if(dist<bd){bd=dist;best=cc;}}
-        var su=sums[best];su[0]+=sp[0];su[1]+=sp[1];su[2]+=sp[2];su[3]++;}
-      for(var u=0;u<K;u++)if(sums[u][3]>0){cents[u][0]=sums[u][0]/sums[u][3];cents[u][1]=sums[u][1]/sums[u][3];cents[u][2]=sums[u][2]/sums[u][3];}}
-    var flatC=new Float64Array(K*3);
-    for(var z=0;z<K;z++){flatC[z*3]=cents[z][0];flatC[z*3+1]=cents[z][1];flatC[z*3+2]=cents[z][2];}
-    var out=new Uint8ClampedArray(n*4);
-    for(var pp=0;pp<n;pp++){var ii=pp*4,r0=data[ii],g0=data[ii+1],b0=data[ii+2],bb=0,bdd=1e12;
-      for(var e=0;e<K;e++){var dr2=r0-flatC[e*3],dg2=g0-flatC[e*3+1],db2=b0-flatC[e*3+2],dd=dr2*dr2+dg2*dg2+db2*db2;if(dd<bdd){bdd=dd;bb=e;}}
-      out[ii]=flatC[bb*3];out[ii+1]=flatC[bb*3+1];out[ii+2]=flatC[bb*3+2];out[ii+3]=255;}
-    return out;
+  // ---------- RGB <-> LAB (perceptual colour space, so clustering matches how eyes group colour) ----------
+  function srgbToLinear(c){ return c<=0.04045 ? c/12.92 : Math.pow((c+0.055)/1.055,2.4); }
+  function linearToSrgb(c){ c=c<0?0:(c>1?1:c); return c<=0.0031308 ? c*12.92 : 1.055*Math.pow(c,1/2.4)-0.055; }
+  function labF(t){ return t>0.008856 ? Math.pow(t,1/3) : (7.787*t+16/116); }
+  function labFInv(t){ var t3=t*t*t; return t3>0.008856 ? t3 : (t-16/116)/7.787; }
+  function rgb2lab(r,g,b){
+    var rl=srgbToLinear(r/255), gl=srgbToLinear(g/255), bl=srgbToLinear(b/255);
+    var x=(rl*0.4124564+gl*0.3575761+bl*0.1804375)/0.95047;
+    var y=(rl*0.2126729+gl*0.7151522+bl*0.0721750);
+    var z=(rl*0.0193339+gl*0.1191920+bl*0.9503041)/1.08883;
+    var fx=labF(x), fy=labF(y), fz=labF(z);
+    return [116*fy-16, 500*(fx-fy), 200*(fy-fz)];
   }
+  function lab2rgb(L,A,B){
+    var fy=(L+16)/116, fx=fy+A/500, fz=fy-B/200;
+    var x=labFInv(fx)*0.95047, y=labFInv(fy), z=labFInv(fz)*1.08883;
+    var rl=x*3.2404542+y*-1.5371385+z*-0.4985314;
+    var gl=x*-0.9692660+y*1.8760108+z*0.0415560;
+    var bl=x*0.0556434+y*-0.2040259+z*1.0572252;
+    return [linearToSrgb(rl)*255, linearToSrgb(gl)*255, linearToSrgb(bl)*255];
+  }
+  function slicSegments(lab,w,h,numSuperpixels,compactness){
+    var S=Math.max(2,Math.round(Math.sqrt((w*h)/numSuperpixels)));
+    var centers=[];
+    for(var y=Math.floor(S/2);y<h;y+=S){
+      for(var x=Math.floor(S/2);x<w;x+=S){var idx=(y*w+x)*3;centers.push([lab[idx],lab[idx+1],lab[idx+2],x,y]);}
+    }
+    var numK=centers.length,labels=new Int32Array(w*h).fill(-1),dist=new Float32Array(w*h);
+    var m2=compactness*compactness,S2=S*S;
+    for(var iter=0;iter<8;iter++){
+      dist.fill(Infinity);
+      for(var ci=0;ci<numK;ci++){
+        var cen=centers[ci],cL=cen[0],ca=cen[1],cb=cen[2],cx=cen[3],cy=cen[4];
+        var y0=Math.max(0,Math.round(cy-S)),y1=Math.min(h-1,Math.round(cy+S));
+        var x0=Math.max(0,Math.round(cx-S)),x1=Math.min(w-1,Math.round(cx+S));
+        for(var yy=y0;yy<=y1;yy++){var rowBase=yy*w;
+          for(var xx=x0;xx<=x1;xx++){
+            var p=rowBase+xx,li=p*3;
+            var dl=lab[li]-cL,da=lab[li+1]-ca,db=lab[li+2]-cb,dc2=dl*dl+da*da+db*db;
+            var dx=xx-cx,dy=yy-cy,ds2=dx*dx+dy*dy,D=dc2+(ds2/S2)*m2;
+            if(D<dist[p]){dist[p]=D;labels[p]=ci;}
+          }}
+      }
+      var sums=new Float64Array(numK*5),counts=new Float64Array(numK);
+      for(var p2=0;p2<w*h;p2++){
+        var lb=labels[p2]; if(lb<0) continue;
+        var li2=p2*3,py=(p2/w)|0,px=p2-py*w,base=lb*5;
+        sums[base]+=lab[li2];sums[base+1]+=lab[li2+1];sums[base+2]+=lab[li2+2];
+        sums[base+3]+=px;sums[base+4]+=py;counts[lb]++;
+      }
+      for(var ci2=0;ci2<numK;ci2++){if(counts[ci2]>0){var b2=ci2*5;
+        centers[ci2][0]=sums[b2]/counts[ci2];centers[ci2][1]=sums[b2+1]/counts[ci2];centers[ci2][2]=sums[b2+2]/counts[ci2];
+        centers[ci2][3]=sums[b2+3]/counts[ci2];centers[ci2][4]=sums[b2+4]/counts[ci2];}}
+    }
+    // fallback for any pixel a window never reached (rare)
+    for(var p3=0;p3<w*h;p3++){
+      if(labels[p3]<0){
+        var li3=p3*3,py3=(p3/w)|0,px3=p3-py3*w,best=0,bd=1e18;
+        for(var ci3=0;ci3<numK;ci3++){var cen3=centers[ci3];
+          var dl3=lab[li3]-cen3[0],da3=lab[li3+1]-cen3[1],db3=lab[li3+2]-cen3[2];
+          var dx3=px3-cen3[3],dy3=py3-cen3[4],D3=dl3*dl3+da3*da3+db3*db3+(dx3*dx3+dy3*dy3)/S2*m2;
+          if(D3<bd){bd=D3;best=ci3;}}
+        labels[p3]=best;
+      }
+    }
+    return {labels:labels,centers:centers,numK:numK};
+  }
+  // Bright specks (eye whites, teeth) sometimes land inside a much darker superpixel.
+  // Pull those pixels out into their own new region so they keep a light colour.
+  function rescueBrightRegions(lab,seg,w,h){
+    var labels=seg.labels,centers=seg.centers,numK=centers.length;
+    // brightness of each superpixel
+    var segL=new Float32Array(numK);for(var c=0;c<numK;c++)segL[c]=centers[c][0];
+    var newLabel=numK, added=[];
+    var visited=new Uint8Array(w*h), stack=[];
+    for(var p=0;p<w*h;p++){
+      if(visited[p])continue;
+      var L=lab[p*3], seL=segL[labels[p]];
+      // pixel is much brighter than the region it's stuck in, and genuinely bright
+      if(L>78 && L-seL>16){
+        // flood fill the connected bright blob
+        stack.length=0;stack.push(p);visited[p]=1;
+        var blob=[];
+        while(stack.length){
+          var q=stack.pop();blob.push(q);
+          var qy=(q/w)|0, qx=q-qy*w;
+          var nb=[q-1,q+1,q-w,q+w];
+          for(var b=0;b<4;b++){var nq=nb[b];if(nq<0||nq>=w*h)continue;
+            var ny=(nq/w)|0,nx=nq-ny*w;if(Math.abs(nx-qx)>1)continue;
+            if(!visited[nq]&&lab[nq*3]>72&&lab[nq*3]-segL[labels[nq]]>10){visited[nq]=1;stack.push(nq);}}
+        }
+        if(blob.length>=6){
+          var sl=0,sa=0,sb=0;
+          for(var k=0;k<blob.length;k++){var li=blob[k]*3;sl+=lab[li];sa+=lab[li+1];sb+=lab[li+2];labels[blob[k]]=newLabel;}
+          centers.push([sl/blob.length,sa/blob.length,sb/blob.length,0,0]);
+          added.push(newLabel);newLabel++;
+        }
+      } else { visited[p]=1; }
+    }
+    seg.numK=centers.length;
+  }
+  function paletteFromCenters(centers,K){
+    var n=centers.length; K=Math.max(1,Math.min(K,n));
+
+    // chroma-weighted distance: saturated colours count for MUCH more, so small vivid
+    // regions (pinks, yellows, blues) don't get swallowed by the big dark background.
+    function dist2(a,b){
+      var dl=a[0]-b[0],da=a[1]-b[1],db=a[2]-b[2];
+      return dl*dl+3.2*(da*da+db*db);
+    }
+    // k-means++ seeding: deliberately spreads seeds across distinct colours
+    var cents=[],chosen=new Uint8Array(n),locked=[];
+    // Reserve a clean-white slot if the painting has a bright near-neutral region
+    // (eye whites, teeth) — otherwise white gets tinted by nearby pale blues.
+    var wi=-1,wScore=-1;
+    for(var wf=0;wf<n;wf++){var L=centers[wf][0],chr=centers[wf][1]*centers[wf][1]+centers[wf][2]*centers[wf][2];
+      if(L>84&&chr<120){var sc=L-chr*0.05;if(sc>wScore){wScore=sc;wi=wf;}}}
+    if(wi>=0){cents.push([centers[wi][0],centers[wi][1],centers[wi][2]]);chosen[wi]=1;locked.push(cents.length-1);}
+    var first=0,maxChroma=-1;
+    for(var f=0;f<n;f++){if(chosen[f])continue;var ch=centers[f][1]*centers[f][1]+centers[f][2]*centers[f][2];if(ch>maxChroma){maxChroma=ch;first=f;}}
+    cents.push([centers[first][0],centers[first][1],centers[first][2]]);chosen[first]=1;
+    var dmin=new Float64Array(n);
+    for(var d0=0;d0<n;d0++){dmin[d0]=1e18;for(var ci0=0;ci0<cents.length;ci0++){var dd0=dist2(centers[d0],cents[ci0]);if(dd0<dmin[d0])dmin[d0]=dd0;}}
+    // Cap how many near-neutral (dark/gray) slots we spend — the artist cares about the
+    // bright colours, so reserve most of the palette for saturated regions.
+    var neutralCap=Math.max(3,Math.round(K*0.28)), neutralUsed=0;
+    for(var kk=cents.length;kk<K;kk++){
+      var pick=-1,pd=-1;
+      for(var t=0;t<n;t++){
+        if(chosen[t])continue;
+        var chr2=centers[t][1]*centers[t][1]+centers[t][2]*centers[t][2];
+        var isNeutral=chr2<90;
+        if(isNeutral&&neutralUsed>=neutralCap)continue;   // stop spending slots on darks
+        // weight the pick by how colourful it is, so vivid regions win ties
+        var score=dmin[t]*(isNeutral?1:1+Math.min(chr2,1600)/400);
+        if(score>pd){pd=score;pick=t;}
+      }
+      if(pick<0){ // only neutrals left and cap hit — fall back to plain distance
+        for(var t2=0;t2<n;t2++){if(!chosen[t2]&&dmin[t2]>pd){pd=dmin[t2];pick=t2;}}
+      }
+      if(pick<0)break;
+      var pchr=centers[pick][1]*centers[pick][1]+centers[pick][2]*centers[pick][2];
+      if(pchr<90)neutralUsed++;
+      cents.push([centers[pick][0],centers[pick][1],centers[pick][2]]);chosen[pick]=1;
+      for(var u=0;u<n;u++){var nd=dist2(centers[u],cents[cents.length-1]);if(nd<dmin[u])dmin[u]=nd;}
+    }
+    var Kc=cents.length;
+    var isLocked=new Uint8Array(Kc);for(var lz=0;lz<locked.length;lz++)isLocked[locked[lz]]=1;
+    var lockedVals=locked.map(function(li){return [cents[li][0],cents[li][1],cents[li][2]];});
+    for(var it=0;it<15;it++){
+      var sums=[];for(var k=0;k<Kc;k++)sums.push([0,0,0,0]);
+      for(var i=0;i<n;i++){
+        var p=centers[i],best=0,bd=1e18;
+        for(var k2=0;k2<Kc;k2++){var dd=dist2(p,cents[k2]);if(dd<bd){bd=dd;best=k2;}}
+        var su=sums[best];su[0]+=p[0];su[1]+=p[1];su[2]+=p[2];su[3]++;
+      }
+      for(var k3=0;k3<Kc;k3++)if(sums[k3][3]>0&&!isLocked[k3]){cents[k3][0]=sums[k3][0]/sums[k3][3];cents[k3][1]=sums[k3][1]/sums[k3][3];cents[k3][2]=sums[k3][2]/sums[k3][3];}
+      // keep the reserved white anchored so it stays clean and doesn't drift toward blue
+      for(var lv=0;lv<locked.length;lv++){cents[locked[lv]][0]=lockedVals[lv][0];cents[locked[lv]][1]=lockedVals[lv][1];cents[locked[lv]][2]=lockedVals[lv][2];}
+    }
+    var segAssign=new Int32Array(n);
+    for(var i2=0;i2<n;i2++){
+      var p2=centers[i2],best2=0,bd2=1e18;
+      for(var k4=0;k4<Kc;k4++){var d2=dist2(p2,cents[k4]);if(d2<bd2){bd2=d2;best2=k4;}}
+      segAssign[i2]=best2;
+    }
+    return {palette:cents,segAssign:segAssign};
+  }
+
 
   // ---------- main flow ----------
   drop.addEventListener('click',function(){fileInput.click();});
@@ -530,6 +703,9 @@
       vis.forEach(function(i){var im=loaded[i];var s=Math.min(W/im.naturalWidth,H/im.naturalHeight),w=im.naturalWidth*s,h=im.naturalHeight*s;ctx.drawImage(im,(W-w)/2,(H-h)/2,w,h);});
       var a=document.createElement('a');a.download='painting-'+LABELS[current].toLowerCase()+'.png';a.href=c.toDataURL('image/png');a.click();}
   });
+
+  var cy=document.getElementById('copyYear');
+  if(cy) cy.textContent=new Date().getFullYear();
 
   render();
 })();
